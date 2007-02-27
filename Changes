@@ -1,0 +1,6 @@
+Revision history for Perl extension Net::DHCPClientLive.
+
+0.01  Mon Feb 26 18:38:07 2007
+	- original version; created by h2xs 1.22 with options
+		-X -n Net::DHCPClientLive
+
