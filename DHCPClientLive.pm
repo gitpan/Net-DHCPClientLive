@@ -4,7 +4,7 @@ use 5.008;
 use warnings;
 use Carp;
 our @ISA = qw();
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 use Net::RawIP;
 use Net::ARP;
@@ -26,7 +26,7 @@ my %fields = (
               xid => undef,
               secs => 0,  
               flags => 0,
-              ciaddr => undef,       
+              ciaddr => '0.0.0.0',       
               yiaddr => undef,      
               siaddr => undef,     
               giaddr => undef,    
@@ -44,7 +44,6 @@ sub new {
    my $that = shift;
    my $class = ref( $that ) || $that;
    my $self = { %fields };
-
    bless $self, $class;
    my ($tobeState);
 
@@ -61,6 +60,7 @@ sub new {
    }
    $self->{"chaddr"} = $self->{"cltmac"};
    $self->{'verb'} = 1 if ($self->{'debug'});
+   return undef unless(ref ($self->pktcaphd()));
    return undef if ($tobeState && ! $self->goState($tobeState));
    return $self;
 }
@@ -109,14 +109,18 @@ sub goState {
          $self->decline();
          $self->init();
       }elsif($pkt) {  
-         $self->{'state'} = 'BOUND';
-         $self->{'ciaddr'} = $pkt->{'yiaddr'};
-         $self->{'siaddr'} = $pkt->{'siaddr'};
-         $self->{'giaddr'} = $pkt->{'giaddr'};
-         $self->{'lease'} = $pkt->{'options'}{'51'};
-         $self->{'t1'} = $pkt->{'options'}{'58'};
-         $self->{'t2'} = $pkt->{'options'}{'59'};
-         return 0 if ($tobeState ne 'BOUND' && ! $self->goState($tobeState));
+         if ($pkt->{'options'}{'53'} == 6) {
+            $self->init();
+         }else{
+            $self->{'state'} = 'BOUND';
+            $self->{'ciaddr'} = $pkt->{'yiaddr'};
+            $self->{'siaddr'} = $pkt->{'siaddr'};
+            $self->{'giaddr'} = $pkt->{'giaddr'};
+            $self->{'lease'} = $pkt->{'options'}{'51'};
+            $self->{'t1'} = $pkt->{'options'}{'58'};
+            $self->{'t2'} = $pkt->{'options'}{'59'};
+            return 0 if ($tobeState ne 'BOUND' && ! $self->goState($tobeState));
+         }
       }else{
          return 0 unless($pkt = $self->request());
          $self->prtpkt($pkt) if ($self->{'debug'});
@@ -179,7 +183,6 @@ sub goState {
 sub discover {
    my $self = shift;
    my %options = %{$self->{options}};
-   my $pkt;
 
    $self->{'ciaddr'} = '0.0.0.0';
    $self->{'yiaddr'} = '0.0.0.0';
@@ -192,9 +195,7 @@ sub discover {
 
    $self->pktsend();
    $self->{'state'} = 'SELECT';
-   return 0 unless(ref (my $caphd = $self->pktcaphd()));
-   $pkt = $self->pktrcv($caphd);
-   return $pkt;
+   return $self->pktrcv();
 }
 
 sub request { 
@@ -208,9 +209,7 @@ sub request {
    $self->{"options"} = \%options;
    $self->pktsend();
    $self->{'state'} = 'REQUEST';
-   return 0 unless(ref (my $caphd = $self->pktcaphd()));
-   $pkt = $self->pktrcv($caphd);
-   return $pkt;
+   return $self->pktrcv();
 }
 sub renew {
    my $self = shift;
@@ -222,8 +221,7 @@ sub renew {
    $self->{"options"} = \%options;
    $self->pktsend();
    $self->{'state'} = 'RENEW';
-   return 0 unless(ref (my $caphd = $self->pktcaphd()));
-   while ($pkt = $self->pktrcv($caphd)) {
+   while ($pkt = $self->pktrcv()) {
       if ($pkt->{ethertype} eq '0806') {
          $self->arpreply();
       }else{
@@ -243,8 +241,7 @@ sub rebind {
    $self->{"options"} = \%options;
    $self->pktsend();
    $self->{'state'} = 'REBIND';
-   return 0 unless(ref (my $caphd = $self->pktcaphd()));
-   while ($pkt = $self->pktrcv($caphd)) {
+   while ($pkt = $self->pktrcv()) {
       if ($pkt->{ethertype} eq '0806') {
          $self->arpreply();
       }else{
@@ -284,10 +281,13 @@ sub pktsend {
    my $macaddr = $self->{'cltmac'};
    my $interface = $self->{'interface'};
    my $data = $self->encode();
-
-   my $p = new Net::RawIP( {udp => {}} );
-   $p->ethnew( $interface );
-
+   my $p;
+   if (exists $self->{rawip}) {
+      $p = $self->{rawip};
+   }else{
+      $p = new Net::RawIP( {udp => {}} );
+      $p->ethnew( $interface );
+   }
    if ($self->{"state"} =~ /INIT|SELECT|REQUEST|REBIND|RENEW/) {
       $p->ethset( source => $macaddr, dest => 'ff:ff:ff:ff:ff:ff');
       $p->set( {ip => {saddr => '0.0.0.0', daddr => '255.255.255.255'},
@@ -305,6 +305,7 @@ sub pktsend {
       printf "\t%s (%s) :%d ===> %s (%s) :%d\n", ip2dot($srcip), net2mac($srcmac), $srcport, ip2dot($dstip), net2mac($dstmac), $dstport;
       print "\tDHCP ", $msgtype[$self->{'options'}{53}], "\n";
    }
+   $self->{rawip} = $p unless(exists $self->{rawip});
    return 1;
 }
 
@@ -320,11 +321,7 @@ sub arpreply {
 sub pktcaphd {
    my $self = shift;
    my $filter;
-   if ($self->{'state'} eq 'BOUND' || $self->{'state'} eq 'RENEW' || $self->{'state'} eq 'REBIND') {
-      $filter = "udp dst port 68 or arp host $self->{'ciaddr'}";
-   }else{
-      $filter = "udp dst port 68";
-   }
+   $filter = "udp dst port 68 or arp host $self->{'ciaddr'}";
    my $pkt_descriptor = Net::PcapUtils::open( FILTER  => "$filter",
                                               DEV     => $self->{'interface'},
                                               SNAPLEN => 400,
@@ -333,13 +330,14 @@ sub pktcaphd {
   if ( ! ref($pkt_descriptor) ) {
      die "Net::PcapUtils::open returned: $pkt_descriptor\n";
   }
+  $self->{pcaphd} = $pkt_descriptor;
   return $pkt_descriptor;
 }
 
 
 sub pktrcv {
    my $self = shift;
-   my $pkt_descriptor = shift;
+   my $pkt_descriptor = $self->{pcaphd};
    my $pkt;
 
    $SIG{ALRM} = sub { die "timeout"; };
@@ -387,7 +385,7 @@ sub pktrcv {
             my $udp_datagram = NetPacket::UDP->decode( $ip_datagram->{data} );
             my $bootp_datagram = $self->bootpdecode( $udp_datagram->{data} );
             if ($self->{'verb'}) {
-               print "\nRCVD:   DHCP\n";
+               print "\nRCVD: DHCP $msgtype[$bootp_datagram->{'options'}{53}]\n";
                print  "\t$ip_datagram->{src_ip} -> $ip_datagram->{dest_ip}";
                print  "\t( id: $ip_datagram->{id}, ttl: $ip_datagram->{ttl} )\n";
                print  "\tUDP Source: $udp_datagram->{src_port} -> ";
@@ -643,117 +641,134 @@ __END__;
 ######################## User Documentation ##########################
 =head1 NAME
 
-Net::DHCPClientLive - stateful DHCP client object
+	Net::DHCPClientLive - stateful DHCP client object
+
+=cut
 
 =head1 SYNOPSIS
 
-use Net::DHCPClientLive;
-my $client = new Net::DHCPClientLive( interface => "eth0", state => 'BOUND')
-   or die "failed to move to BOUND state\n";
-print "DHCP client $client->{cltmac} is created and assigned $client->{requestip} from server\n";
+   use Net::DHCPClientLive;
+   my $client = new Net::DHCPClientLive( interface => "eth0", state => 'BOUND')
+                      or die "failed to move to BOUND state\n";
+   print "DHCP client $client->{cltmac} is created and assigned $client->{requestip} from server\n";
  
+=cut
+
 =head1 DESCRIPTION
 
-Net::DHCPClientLive allows you to create and manipulate DHCP client(s) so that you can test the behavior of your DHCP server upon client state transition.
+Net::DHCPClientLive allows you to create and manipulate DHCP client(s) so that you
+can test the behavior of your DHCP server upon client state transition.
 
-DHCP client is a stateful host. It reaches "BOUND" state after the successful discover process, and will renew and/or rebind when T1/T2 timer expire. The state will be changed accordingly depending on the behavior of the server.
+DHCP client is a stateful host. It reaches "BOUND" state after the successful discover
+process, and will renew and/or rebind when T1/T2 timer expire. The state will be changed
+accordingly depending on the behavior of the server.
 
-With this module you can move client's state, make transition, and even let it go freely. At each attempt of operation, it can tell whether it success or fail, so that you know if your server works as expected.
+With this module you can move client's state, make transition, and even let it go freely.
+At each attempt of operation, it can tell whether it success or fail, so that you know
+if your server works as expected.
 
-You can create many DHCP clients at the same time. In this way you can easily execute scalability test. Image you create 100 live DHCP clients, they are alive as though there were 100 hosts there, doing renew, rebind, or release interacting with your DHCP server for a few days, just like they do in real scenario.
+You can create many DHCP clients at the same time. In this way you can easily execute
+scalability test. Image you create 100 live DHCP clients, they are alive as though there
+were 100 hosts there, doing renew, rebind, or release interacting with your DHCP server
+for a few days, just like they do in real scenario.
 
 I also provide some code showing how to do this in EXAMPLES section.
 
 Client identifier
- - mac address is the identifier of a client, it's assigned when created and kept in the whole life cycle
- - xid is kept in the client life cycle until back to INIT, when xid is initialized
+   - mac address is the identifier of a client, it's assigned when created and kept in the whole life cycle
+   - xid is kept in the client life cycle until back to INIT, when xid is initialized
 
 The following is the detail description of state transition.
-INIT->SELECT:  
-   send DISCOVER, receive OFFER, check and report, 
-   return true if receiving DHCP OFFER from server, or false if no OFFER received.
-   The state of client moves to SELECT anyway.
+   INIT->SELECT  
+      send DISCOVER, receive OFFER, check and report, 
+      return true if receiving DHCP OFFER from server, or false if no OFFER received.
+      The state of client moves to SELECT anyway.
 
 
-INIT->REQUEST: 
-SELECT->REQUEST: 
-   send DISCOVER, receive OFFER, and send REQUEST, check ACK and report,
-   return true if receiving both DHCP OFFER and ACK from server, or false otherwise
-   The state of client moves to SELECT if no OFFER received or REQUEST if OFFER received.
+   INIT->REQUEST 
+   SELECT->REQUEST 
+      send DISCOVER, receive OFFER, and send REQUEST, check ACK and report,
+      return true if receiving both DHCP OFFER and ACK from server, or false otherwise
+      The state of client moves to SELECT if no OFFER received or REQUEST if OFFER received.
 
-SELECT->SELECT:
-   same as INIT->SELECT, 
-   this allows you to test intensively the server response to DISCOVER
+   SELECT->SELECT
+      same as INIT->SELECT, 
+      this allows you to test intensively the server response to DISCOVER
 
-REQUEST->REQUEST
-   same as SELECT->REQUEST, 
-   this allows you to test intensively the server response to DISCOVER/REQUEST
+   REQUEST->REQUEST
+      same as SELECT->REQUEST, 
+      this allows you to test intensively the server response to DISCOVER/REQUEST
 
 
-# BOUND:
-INIT->BOUND: 
-    send DISCOVER, receive OFFER, and send REQUEST, receive ACK and update.
-    return true only if the whole process correct.
-    The state of client moves accordingly to SELECT, REQUEST, or BOUND
-        SELECT if client sends DISCOVER
-        REQUEST if client receives OFFER, then sends REQUEST
-        BOUND if client receives ACK after sending REQUEST
+   INIT->BOUND 
+      send DISCOVER, receive OFFER, and send REQUEST, receive ACK and update.
+      return true only if the whole process correct.
+      The state of client moves accordingly to SELECT, REQUEST, or BOUND
+      SELECT if client sends DISCOVER
+      REQUEST if client receives OFFER, then sends REQUEST
+      BOUND if client receives ACK after sending REQUEST
 
-SELECT->BOUND: back to INIT, then same to above
-REQUEST->BOUND: 
-   send REQUEST, receive ACK and update (because client already has server offer info in obj)
-   return true only if the client receives ACK.
-   The state of client moves to BOUND if receives ACK, or stay at REQUEST if no ACK
+   SELECT->BOUND
+      back to INIT, then same to above
 
-BOUND->BOUND: 
-   Simulates T1 expire. Sends unicast REQUEST to server, and move to RENEW
-       move to BOUND and refresh lease after receiving ACK from server
-   return true if receives ACK
-   Note: Linux server sends ARP request to client ip, client has to replay this ARP
+   REQUEST->BOUND
+      send REQUEST, receive ACK and update (because client already has server offer info in obj)
+      return true only if the client receives ACK.
+      The state of client moves to BOUND if receives ACK, or stay at REQUEST if no ACK
+
+   BOUND->BOUND 
+      Simulates T1 expire. Sends unicast REQUEST to server, and move to RENEW
+      move to BOUND and refresh lease after receiving ACK from server
+      return true if receives ACK
+      Note: Linux server sends ARP request to client ip, client has to replay this ARP
          before Linux server sends ACK
 
-RENEW->BOUND:
-REBIND->BOUND:
-   Simulates T2 expire. sends broadcase REQUEST, move to BOUND and refresh lease if receives ACK
-   return true if receives ACK
+   RENEW->BOUND
+   REBIND->BOUND
+      Simulates T2 expire. sends broadcase REQUEST, move to BOUND and refresh lease if receives ACK
+      return true if receives ACK
 
 
-BOUND->RENEW:
-   Simulates T1 expire. Sends unicast REQUEST to server, and move to RENEW
-   return true if receives ACK 
-   Note: Linux server sends ARP request to client ip, client also replay this ARP
+   BOUND->RENEW
+      Simulates T1 expire. Sends unicast REQUEST to server, and move to RENEW
+      return true if receives ACK 
+      Note: Linux server sends ARP request to client ip, client also replay this ARP
          before Linux server sends ACK
 
-BOUND->REBIND
-   Does BOUND->RENEW first
-   Then ignore ACK and does RENEW->REBIND
-RENEW->REBIND
-   Simulates T2 expire. sends broadcase REQUEST
-   return true if receives ACK to this broadcase REQUEST
+   BOUND->REBIND
+      Does BOUND->RENEW first
+      Then ignore ACK and does RENEW->REBIND
+
+   RENEW->REBIND
+      Simulates T2 expire. sends broadcase REQUEST
+      return true if receives ACK to this broadcase REQUEST
 
 
-REBIND->INIT
-RENEW->INIT
-   Sends RELEASE and move to INIT
+   REBIND->INIT
+   RENEW->INIT
+      Sends RELEASE and move to INIT
 
  
-RENEW->SELECT  
-RENEW->REQUEST
-REBIND->SELECT
-REBIND->REQUEST
+   RENEW->SELECT  
+   RENEW->REQUEST
+   REBIND->SELECT
+   REBIND->REQUEST
 
-   1. ->INIT
-   2. INIT->REQUEST
+      1. ->INIT
+      2. INIT->REQUEST
 
 
+   undef->INIT
+      do nothing
 
-undef->INIT:
-   do nothing
-SELECT->INIT
-   clear XID
+   SELECT->INIT
+      clear XID
 
-REQUEST->INIT    send DECLINE, clear XID
+   REQUEST->INIT 
+      send DECLINE, clear XID
 
+
+=cut
 
 =head1 METHODS
 
@@ -766,13 +781,15 @@ new - create a new Net::DHCPClientLive object
                                   options => {key => value, ...}, # refer to rfc2131 for options
                                   verb => $verb);     # print more pkt exchange info
 
-   You don't need to specify options unless you have special interest, in which case, the dhcp packet exchangewill contain those options.
-   If there is no "mac", the client is assgined one automatically, and it becomes the identifier of the client.
+   You don't need to specify options unless you have special interest, in which case, the dhcp packet
+   exchangewill contain those options. If there is no "mac", the client is assgined one automatically,
+   and it becomes the identifier of the client.
 
 
 goState($state)
 
   $clt->goState('RENEW');
+
   The only argument to goState method is the state name you are driving the client to move to. 
   It returns true if the client successfully move the state, otherwise returns false.
   Refer to "DESCRIPTION" section for detail of state transition
@@ -791,120 +808,122 @@ Other methods
  $clt->release()
 
 
+=cut
+
 =head1 EXAMPLES
 
 Here is a subroutine used to do state transition. It creates a client and try to move its state to $middleState, then it moves to $finalState if it is provided, 
 It returns the client object on success, or false on failure.
 
 
-sub stateTransition {
-   my ($middleState,$finalState) = @_;
-   my $clt;
-   unless ($clt = new Net::DHCPClientLive( interface => "eth1", state => $middleState )) {
-      print "server response abnormal to $clt->{cltmac}\n";
-      return 0;
-   }else{
-      print "$clt->{cltmac} moved to $clt->{'state'}\n";
+   sub stateTransition {
+      my ($middleState,$finalState) = @_;
+      my $clt;
+      unless ($clt = new Net::DHCPClientLive( interface => "eth1", state => $middleState )) {
+         print "server response abnormal to $clt->{cltmac}\n";
+         return 0;
+      }else{
+         print "$clt->{cltmac} moved to $clt->{'state'}\n";
+      }
+      return $clt unless($finalState);
+      unless ($clt->goState($finalState)) {
+         print "server response abnormal to $clt->{cltmac}\n";
+         return 0;
+      }else{
+         print "$clt->{cltmac} moved to $clt->{'state'}\n";
+      }
+      return $clt;
    }
-   return $clt unless($finalState);
-   unless ($clt->goState($finalState)) {
-      print "server response abnormal to $clt->{cltmac}\n";
-      return 0;
-   }else{
-      print "$clt->{cltmac} moved to $clt->{'state'}\n";
-   }
-   return $clt;
-}
 
 
 Here is another example to simulate multiple live clients. Please note that each client exists as individual process in your host.
 
-$SIG{CHLD} = sub {while( waitpid(-1, WNOHANG) > 0 ) {} };
-$SIG{INT} = sub { kill 'KILL', 0 };
-$SIG{QUIT} = sub { kill 'KILL', 0 };
-my $clt;
-my @liveClt = ();
-
-# create $numClient clients 
-for (my $k = 1; $k <= $numClient; $k++) {
-   if ($clt = new Net::DHCPClientLive( interface => "$hostint", state => 'BOUND', verb => $verb)) {
-      print "created live a client No.$k: $clt->{cltmac}\n";
-      my $W = gensym();
-      my $R = gensym();
-      my $pid;
-      if (pipe($R,$W) && defined($pid = fork())) {
-         if ($pid) {
-            # keep the client
-            close $W;
-            $clt->{sock} = $R;
-            push @liveClt, $clt;
-         }else{
-            # a client is created
-            close $R;
-            open(STDOUT, ">&$W");
-            select $W; $| = 1;
-            while (1) {
-               my $now = time;
-               while (time < $now + $clt->{t1}) {};
-               print "T1 expired, renewing ... ";
-               unless ($clt->goState('BOUND')) {
-                  print "failed\n";
+   $SIG{CHLD} = sub {while( waitpid(-1, WNOHANG) > 0 ) {} };
+   $SIG{INT} = sub { kill 'KILL', 0 };
+   $SIG{QUIT} = sub { kill 'KILL', 0 };
+   my $clt;
+   my @liveClt = ();
+   
+   # create $numClient clients 
+   for (my $k = 1; $k <= $numClient; $k++) {
+      if ($clt = new Net::DHCPClientLive( interface => "$hostint", state => 'BOUND', verb => $verb)) {
+         print "created live a client No.$k: $clt->{cltmac}\n";
+         my $W = gensym();
+         my $R = gensym();
+         my $pid;
+         if (pipe($R,$W) && defined($pid = fork())) {
+            if ($pid) {
+               # keep the client
+               close $W;
+               $clt->{sock} = $R;
+               push @liveClt, $clt;
+            }else{
+               # a client is created
+               close $R;
+               open(STDOUT, ">&$W");
+               select $W; $| = 1;
+               while (1) {
                   my $now = time;
-                  while (time < $now + $clt->{t2} - $clt->{t1}) {};
-                  print "T2 expired, rebinding ...";
+                  while (time < $now + $clt->{t1}) {};
+                  print "T1 expired, renewing ... ";
                   unless ($clt->goState('BOUND')) {
-                     print "rebinding failed, relasing the client\n";
-                     $clt->goState('INIT');
-                     exit 0;
+                     print "failed\n";
+                     my $now = time;
+                     while (time < $now + $clt->{t2} - $clt->{t1}) {};
+                     print "T2 expired, rebinding ...";
+                     unless ($clt->goState('BOUND')) {
+                        print "rebinding failed, relasing the client\n";
+                        $clt->goState('INIT');
+                        exit 0;
+                     }else{
+                        print "done\n";
+                     }
                   }else{
                      print "done\n";
                   }
-               }else{
-                  print "done\n";
                }
             }
+         }else{
+            print("max clients has been created\n");
+            last;
          }
       }else{
-         print("max clients has been created\n");
-         last;
-      }
-   }else{
-      print "No.$k client failed to go to BOUND\n";
-   }
-}
-
-# main process shows information printed by clients
-if (@liveClt) {
-   print "Totally created ", scalar @liveClt, " client(s)\n";
-   my $liveCltSock = new IO::Select();
-   for (@liveClt) {
-      $liveCltSock->add($_->{sock});
-   }
-   while ( my @cltCanSay = $liveCltSock->can_read() ) {
-      for my $cltSock (@cltCanSay) {
-         my ($client) = grep {$_->{sock} eq $cltSock} @liveClt;
-         my $msg = <$cltSock>;
-         next if ($msg =~ /^\s*$/);
-         print "$client->{cltmac}: $msg";
+         print "No.$k client failed to go to BOUND\n";
       }
    }
-}
+   
+   # main process shows information printed by clients
+   if (@liveClt) {
+      print "Totally created ", scalar @liveClt, " client(s)\n";
+      my $liveCltSock = new IO::Select();
+      for (@liveClt) {
+         $liveCltSock->add($_->{sock});
+      }
+      while ( my @cltCanSay = $liveCltSock->can_read() ) {
+         for my $cltSock (@cltCanSay) {
+            my ($client) = grep {$_->{sock} eq $cltSock} @liveClt;
+            my $msg = <$cltSock>;
+            next if ($msg =~ /^\s*$/);
+            print "$client->{cltmac}: $msg";
+         }
+      }
+   }
 
 =head1 REQUIRES
 
 This module need to use the following modules
-Net::RawIP;
-Net::ARP;
-Net::PcapUtils;
-NetPacket::ARP;
-NetPacket::Ethernet;
-NetPacket::IP;
-NetPacket::UDP;
+   Net::RawIP;
+   Net::ARP;
+   Net::PcapUtils;
+   NetPacket::ARP;
+   NetPacket::Ethernet;
+   NetPacket::IP;
+   NetPacket::UDP;
 
 
 =head1 AUTHOR
 
-Ming Zhang, E<lt>ming2004@gmail.com<gt>
+Ming Zhang, E<lt>ming2004@gmail.com
 
 =head1 COPYRIGHT AND LICENSE
 
